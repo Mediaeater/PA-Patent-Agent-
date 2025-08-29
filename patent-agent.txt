@@ -190,9 +190,12 @@ def generate_patent(inp: InventionInput):
     # optionally export to docx/xml (can be called asynchronously in your infra)
     final_json['audit'] = {"model":"YOUR_MODEL", "temperature":0.0}
     return final_json
+
+
 Notes:
 Implement LLM_CALL to call your model provider and return assistant text.
 For production, wrap LLM calls with retry/backoff and logging.
+
 6) Example prompts for DRAFT mode (concrete)
 Use these templates for the DRAFT call (embedded in DRAFT_PROMPT):
 Produce JSON:
@@ -216,6 +219,7 @@ Example input (for testing):
  "title": "AI-guided drone for crop health monitoring",
  "description":"A drone uses hyperspectral imaging and an on-device model to detect crop disease in real time, sends geo-tagged alerts, and autonomously replans flight path to re-scan hotspots."
 }
+
 7) Minimal Quality checks (implement locally)
 Add these simple checks after you get draft:
 def basic_claim_checks(draft):
@@ -238,6 +242,7 @@ def basic_claim_checks(draft):
             issues.append({"claim_id":cid, "issue":"Terms lacking support in spec", "terms": missing[:5]})
     return issues
 This is a heuristic — use more advanced NLP checks or an internal knowledge-base for production.
+
 8) Export snippets
 DOCX (python-docx)
 from docx import Document
@@ -278,6 +283,7 @@ def export_simple_xml(final_json, path="patent.xml"):
     tree = ET.ElementTree(root)
     tree.write(path, encoding="utf-8", xml_declaration=True)
     return path
+
 9) Example end-to-end test (text you can paste into /generate body)
 {
   "title": "AI-guided drone for crop health monitoring",
@@ -287,6 +293,7 @@ def export_simple_xml(final_json, path="patent.xml"):
   "jurisdiction": "USPTO"
 }
 Expect: a JSON matching the schema with title, 120-word abstract, background, 1–3 independent claims + dependents, rudimentary novelty assessment, and quality checks.
+
 10) Quick governance & practical tips
 Human-in-the-loop: always review claims and final text. The agent accelerates drafting but does not replace counsel.
 Temperature: set to 0.0–0.2 for drafting legal text to reduce hallucinations.
