@@ -1,0 +1,296 @@
+) Big picture (one-line)
+Input (invention + optional prior art) → Lean Patent Agent (single LLM agent with internal modes) → Structured patent draft + evaluation + exports.
+2) The Single-System Prompt (use as the system instruction)
+Use this as the system message when calling your LLM.
+You are "LeanPatentAgent", a single AI agent that can operate in five internal modes: PREPROCESS, DRAFT, REASON, QUALITY, and ASSEMBLE. Always output JSON only when asked for machine output. Be conservative with legal claims language: use "comprising" for open claims, include at least one independent claim and several dependent claims, and ensure support in the specification. Avoid absolute adjectives. Cite prior-art references when provided.
+
+Modes:
+- PREPROCESS: extract keywords, components, steps, problem, technical effect, suggest IPC codes with confidence.
+- DRAFT: generate Title, 100–150 word Abstract, Background, Summary, Detailed Description (3 embodiments if applicable), Figures descriptions, and Claims (1–3 independent, up to 10 dependents each).
+- REASON: produce novelty assessment, likely inventive step reasoning, infringement pointers, basic valuation/damages estimation if market data provided.
+- QUALITY: run rule-checks (claim antecedent support, antecedent terms present in spec, claim format, consistency, length checks). Return pass/fail with toolable fixes.
+- ASSEMBLE: return final JSON containing all sections and an "export" object for DOCX and USPTO-like XML templates.
+
+Behavior:
+- Keep JSON schema stable and machine-friendly.
+- If user did not provide prior art, state "prior_art: none provided" in reasoning outputs.
+- When uncertain, mark confidence between 0.0 and 1.0 and list assumptions.
+- Provide short, actionable fixes when checks fail.
+
+3) JSON schema (canonical single draft output)
+
+
+{
+  "meta": {
+    "title": "",
+    "inventor": [],
+    "jurisdiction": "USPTO",
+    "date": ""
+  },
+  "preprocess": {
+    "keywords": [],
+    "components": [],
+    "steps": [],
+    "ipc_suggestions": [{"code":"", "score":0.0}]
+  },
+  "draft": {
+    "title": "",
+    "abstract": "",
+    "background": "",
+    "summary": "",
+    "detailed_description": "",
+    "figures": [{"id":"FIG.1", "desc":""}],
+    "claims": [{"id":1, "type":"independent","text":""}]
+  },
+  "reasoning": {
+    "novelty_assessment": {"verdict":"Likely/Unclear/Unlikely","confidence":0.0, "reasons":[]},
+    "infringement_pointers": [],
+    "valuation_estimate": {"low_mid_high":"", "assumptions":[]}
+  },
+  "quality": {
+    "claim_checks": [{"claim_id":1,"antecedent_support":true,"issues":[]}],
+    "overall_pass": true,
+    "fixes":[]
+  },
+  "export": {
+    "docx_path": "",
+    "xml_path": ""
+  },
+  "audit": {"model":"", "temperature":0.0}
+}
+
+
+Orchestration logic (how to run modes in one call)
+
+
+Single LLM call with the system prompt instructing the agent to run modes sequentially (faster; one-shot).
+Multi-call internal (call the LLM 3–4 times: PREPROCESS → DRAFT → REASON+QUALITY → ASSEMBLE) for better modularity.
+I recommend the multi-call variant for reliability. Below is a minimal FastAPI skeleton that does that.
+
+
+FastAPI skeleton (Python) — drop-in, replace LLM_CALL() with your provider call
+This is ready-to-run logic (no secrets included). It uses synchronous LLM calls (abstracted function).
+# file: lean_patent_agent.py
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+import datetime
+import json
+import uuid
+
+app = FastAPI(title="LeanPatentAgent")
+
+# ---------- Replace this with your LLM call (OpenAI, or your LLM client) ----------
+def LLM_CALL(system_prompt: str, user_prompt: str, temperature=0.0):
+    """
+    Implement the actual API call to your LLM here and return the assistant text.
+    Must return raw string.
+    """
+    raise NotImplementedError("Plug your LLM API here")
+
+# ---------- Input model ----------
+class InventionInput(BaseModel):
+    title: Optional[str] = None
+    description: str
+    prior_art: Optional[List[dict]] = None  # e.g., [{"patent":"US123", "excerpt":"..."}]
+    inventor: Optional[List[str]] = None
+    jurisdiction: Optional[str] = "USPTO"
+    date: Optional[str] = None
+
+# ---------- Helper: system prompt (re-use earlier) ----------
+SYSTEM_PROMPT = """[paste the Single-System Prompt from section #2 here]"""
+
+# ---------- Mode templates ----------
+PREPROCESS_PROMPT = """
+Mode: PREPROCESS
+Input JSON:
+{input_json}
+Output JSON with keys: keywords, components, steps, ipc_suggestions
+"""
+
+DRAFT_PROMPT = """
+Mode: DRAFT
+Input JSON:
+{input_json}
+Instructions: produce title, abstract(100-150 words), background, summary, detailed_description (with 3 embodiments if applicable), figures list, and claims (1-3 independent + dependents). Output as JSON with top-level key 'draft'.
+"""
+
+REASON_PROMPT = """
+Mode: REASON
+Input JSON:
+{input_json}
+Instructions: assess novelty, inventive step vs provided prior_art, infringement pointers, and give a valuation estimate if market data provided. Output as JSON under 'reasoning'.
+"""
+
+QUALITY_PROMPT = """
+Mode: QUALITY
+Input JSON:
+{input_json}
+Instructions: run claim checks - antecedent support, claim formatting, inconsistencies. Output as JSON under 'quality'.
+"""
+
+ASSEMBLE_PROMPT = """
+Mode: ASSEMBLE
+Input JSON:
+{input_json}
+Instructions: produce final output JSON matching the canonical schema.
+"""
+
+# ---------- API endpoint ----------
+@app.post("/generate")
+def generate_patent(inp: InventionInput):
+    # 1) normalize input
+    data = inp.dict()
+    data['date'] = data.get('date') or datetime.date.today().isoformat()
+    data['meta_id'] = str(uuid.uuid4())
+
+    # 2) PREPROCESS
+    try:
+        pre_response = LLM_CALL(SYSTEM_PROMPT, PREPROCESS_PROMPT.format(input_json=json.dumps(data)), temperature=0.0)
+        preprocess_json = json.loads(pre_response)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Preprocess failed: {e}")
+
+    data['preprocess'] = preprocess_json
+
+    # 3) DRAFT
+    try:
+        draft_resp = LLM_CALL(SYSTEM_PROMPT, DRAFT_PROMPT.format(input_json=json.dumps(data)), temperature=0.0)
+        draft_json = json.loads(draft_resp)['draft']
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Draft failed: {e}")
+
+    data['draft'] = draft_json
+
+    # 4) REASON
+    try:
+        reason_resp = LLM_CALL(SYSTEM_PROMPT, REASON_PROMPT.format(input_json=json.dumps(data)), temperature=0.0)
+        reason_json = json.loads(reason_resp)['reasoning']
+    except Exception as e:
+        reason_json = {"novelty_assessment":{"verdict":"Unclear","confidence":0.0,"reasons":[str(e)]}}
+
+    data['reasoning'] = reason_json
+
+    # 5) QUALITY
+    try:
+        quality_resp = LLM_CALL(SYSTEM_PROMPT, QUALITY_PROMPT.format(input_json=json.dumps(data)), temperature=0.0)
+        quality_json = json.loads(quality_resp)['quality']
+    except Exception as e:
+        quality_json = {"overall_pass": False, "fixes":[str(e)]}
+
+    data['quality'] = quality_json
+
+    # 6) ASSEMBLE
+    try:
+        assemble_resp = LLM_CALL(SYSTEM_PROMPT, ASSEMBLE_PROMPT.format(input_json=json.dumps(data)), temperature=0.0)
+        final_json = json.loads(assemble_resp)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Assemble failed: {e}")
+
+    # optionally export to docx/xml (can be called asynchronously in your infra)
+    final_json['audit'] = {"model":"YOUR_MODEL", "temperature":0.0}
+    return final_json
+Notes:
+Implement LLM_CALL to call your model provider and return assistant text.
+For production, wrap LLM calls with retry/backoff and logging.
+6) Example prompts for DRAFT mode (concrete)
+Use these templates for the DRAFT call (embedded in DRAFT_PROMPT):
+Produce JSON:
+{
+ "title": "...",
+ "abstract": "...",
+ "background": "...",
+ "summary": "...",
+ "detailed_description": "...",
+ "figures":[{"id":"FIG.1","desc":"..."}],
+ "claims":[{"id":1,"type":"independent","text":"..."}, ...]
+}
+
+Constraints:
+- Title <= 20 words, no marketing.
+- Abstract 100-150 words, technical summary.
+- Claims must use "comprising". Each dependent claim must refer to a prior claim by number and add a single limitation.
+- Ensure every claim term has antecedent support in the detailed_description.
+Example input (for testing):
+{
+ "title": "AI-guided drone for crop health monitoring",
+ "description":"A drone uses hyperspectral imaging and an on-device model to detect crop disease in real time, sends geo-tagged alerts, and autonomously replans flight path to re-scan hotspots."
+}
+7) Minimal Quality checks (implement locally)
+Add these simple checks after you get draft:
+def basic_claim_checks(draft):
+    issues = []
+    claims = draft.get('claims', [])
+    spec = (draft.get('detailed_description') or "").lower()
+    for c in claims:
+        cid = c['id']
+        text = c['text'].lower()
+        # 1) "comprising" check
+        if "comprising" not in text and "consisting" not in text:
+            issues.append({"claim_id":cid, "issue":"No 'comprising' or equivalent open language."})
+        # 2) antecedent terms
+        tokens = text.split()
+        # collect simple nouns (rough heuristic)
+        # check that each noun appears in spec (very rough)
+        nouns = [w.strip(",.;()") for w in tokens if w.isalpha() and len(w)>3]
+        missing = [n for n in set(nouns) if n not in spec]
+        if missing:
+            issues.append({"claim_id":cid, "issue":"Terms lacking support in spec", "terms": missing[:5]})
+    return issues
+This is a heuristic — use more advanced NLP checks or an internal knowledge-base for production.
+8) Export snippets
+DOCX (python-docx)
+from docx import Document
+
+def export_docx(final_json, path="patent_draft.docx"):
+    doc = Document()
+    meta = final_json.get('meta', {})
+    doc.add_heading(final_json['draft']['title'] or meta.get('title','Patent Draft'), level=1)
+    doc.add_heading('Abstract', level=2)
+    doc.add_paragraph(final_json['draft']['abstract'])
+    doc.add_heading('Background', level=2)
+    doc.add_paragraph(final_json['draft']['background'])
+    doc.add_heading('Summary', level=2)
+    doc.add_paragraph(final_json['draft']['summary'])
+    doc.add_heading('Detailed Description', level=2)
+    doc.add_paragraph(final_json['draft']['detailed_description'])
+    doc.add_heading('Claims', level=2)
+    for c in final_json['draft'].get('claims', []):
+        doc.add_paragraph(f"Claim {c['id']}. {c['text']}")
+    doc.save(path)
+    return path
+Simple USPTO-like XML (template)
+You’ll need to tailor to official USPTO XML schemas — below is a lightweight XML for your own tooling.
+def export_simple_xml(final_json, path="patent.xml"):
+    import xml.etree.ElementTree as ET
+    root = ET.Element("patent")
+    meta = ET.SubElement(root, "meta")
+    ET.SubElement(meta, "title").text = final_json['draft']['title']
+    ET.SubElement(meta, "date").text = final_json['meta']['date']
+    body = ET.SubElement(root, "body")
+    ET.SubElement(body, "abstract").text = final_json['draft']['abstract']
+    desc = ET.SubElement(body, "detailed_description")
+    desc.text = final_json['draft']['detailed_description']
+    claims = ET.SubElement(root, "claims")
+    for c in final_json['draft']['claims']:
+        claim_el = ET.SubElement(claims, "claim", id=str(c['id']))
+        claim_el.text = c['text']
+    tree = ET.ElementTree(root)
+    tree.write(path, encoding="utf-8", xml_declaration=True)
+    return path
+9) Example end-to-end test (text you can paste into /generate body)
+{
+  "title": "AI-guided drone for crop health monitoring",
+  "description": "A drone uses hyperspectral imaging and an on-device model to detect crop disease in real time, sends geo-tagged alerts, and autonomously replans flight path to re-scan hotspots.",
+  "prior_art": [],
+  "inventor": ["Alice Inventor"],
+  "jurisdiction": "USPTO"
+}
+Expect: a JSON matching the schema with title, 120-word abstract, background, 1–3 independent claims + dependents, rudimentary novelty assessment, and quality checks.
+10) Quick governance & practical tips
+Human-in-the-loop: always review claims and final text. The agent accelerates drafting but does not replace counsel.
+Temperature: set to 0.0–0.2 for drafting legal text to reduce hallucinations.
+Temperature ensembles: for creative variants (dependent claims) run small diversity pass at 0.7 and reconcile.
+Prior art: include any patent numbers/URLs in prior_art for better reasoning.
+Logging + Versioning: store model name + prompt + output for audit.
+Security: encrypt IP-at-rest and limit access.
